@@ -6,6 +6,9 @@ using System.Security;
 using System.Threading;
 using System.Xml.Serialization;
 
+using SharePointFile = Microsoft.SharePoint.Client.File;
+using SharePointFolder = Microsoft.SharePoint.Client.Folder;
+
 namespace sharepoint_cleaner
 {
 	internal static class Extensions
@@ -45,275 +48,225 @@ namespace sharepoint_cleaner
 		}
 	}
 
-	internal class SharepointFolderCleanerWorker : IDisposable
+	public class Session
 	{
-		private volatile bool disposed = false;
+		public DateTime Started;
+		public DateTime Continued;
+		public HashSet<string> Processed { get; private set; } = new HashSet<string>();
 
-
-		private Thread thread;
-		private readonly object mutex = new object();
-		private Queue<string> queue;
-
-		private void CleanFolder(ClientContext context, string path)
-		{
-			var folder = context.Web.GetFolderByServerRelativeUrl(path);
-
-			// request files
-			context.Load(folder, f => f.Files);
-			if (!context.ExecuteQueryWithDelayAndAuthCheck())
-				return;
-
-			if (folder.Files.Count > 0)
-			{
-				// request versions for each file
-				foreach (var file in folder.Files)
-					context.Load(file, f => f.Versions);
-				context.ExecuteQueryWithDelay();
-
-				// delete the old versions
-				var num_deletes = 0;
-				foreach (var file in folder.Files)
-				{
-					if (file.Versions.Count > 0)
-					{
-						file.Versions.DeleteAll();
-						num_deletes += file.Versions.Count;
-
-						if (num_deletes >= 20)
-						{
-							context.ExecuteQueryWithDelay();
-							num_deletes = 0;
-						}
-					}
-				}
-				if (num_deletes > 0)
-					context.ExecuteQueryWithDelay();
-			}
-
-			Console.WriteLine($@"{path}: OK");
-		}
-
-		public SharepointFolderCleanerWorker(Uri site_uri, SharePointOnlineCredentials credentials)
-		{
-			queue = new Queue<string>();
-
-			thread = new Thread(() =>
-			{
-				ClientContext context = null;
-
-				try
-				{
-					while (!disposed)
-					{
-						string path = null;
-						lock (mutex)
-						{
-							if (queue.Count == 0)
-								continue;
-							path = queue.Dequeue();
-						}
-
-						if (path != null)
-						{
-							if (context == null)
-							{
-								try
-								{
-									context = new ClientContext(site_uri);
-									context.Credentials = credentials;
-								}
-								catch (Exception e)
-								{
-									Console.Error.WriteLine($@"[{e.GetType()}] {e.Message}");
-								}
-							}
-
-							try
-							{
-								CleanFolder(context, path);
-							}
-							catch (Exception e)
-							{
-								Console.Error.WriteLine($@"{path}: [{e.GetType()}] {e.Message}");
-							}
-
-							Thread.Sleep(50);
-						}
-						else
-							Thread.Sleep(250);
-					}
-
-				}
-				finally
-				{
-					if (context != null)
-					{
-						context.Dispose();
-						context = null;
-					}
-				}
-			});
-			thread.Start();
-		}
-
-		public void Enqueue(Folder folder)
-		{
-			lock (mutex)
-			{
-				queue.Enqueue(folder.ServerRelativeUrl);
-			}
-		}
-
-		public void Wait()
-		{
-			while (!disposed)
-			{
-				lock (mutex)
-				{
-					if (queue.Count == 0)
-						return;
-				}
-
-				Thread.Sleep(200);
-			}
-		}
-
-		public void Dispose()
-		{
-			if (!disposed)
-			{
-				disposed = true;
-				thread.Join();
-				thread = null;
-			}
-			GC.SuppressFinalize(this);
-		}
-	}
-
-	internal class SharepointFolderCleaner : IDisposable
-	{
-		private volatile bool disposed = false;
-		private SharepointFolderCleanerWorker[] workers;
-		private int next_worker = 0;
-
-		private readonly string history_path;
-		private readonly List<string> history;
-		private int history_this_session = 0;
-
-		private void EnqueueFolder(ClientContext context, Uri site_uri, SharePointOnlineCredentials credentials, Folder folder)
-		{
-			// ignore this folder and it's subfolders if it is already in the history
-			if (history.Contains(folder.ServerRelativeUrl))
-				return;
-
-			try
-			{
-				// enqueue this folder
-				var worker_index = (++next_worker) % workers.Length;
-				if (workers[worker_index] == null)
-					workers[worker_index] = new SharepointFolderCleanerWorker(site_uri, credentials);
-				workers[worker_index].Enqueue(folder);
-
-				// enqueue subfolders
-				context.Load(folder, f => f.Folders);
-				if (context.ExecuteQueryWithDelayAndAuthCheck())
-				{
-					foreach (var subfolder in folder.Folders)
-						EnqueueFolder(context, site_uri, credentials, subfolder);
-				}
-			}
-			finally
-			{
-				// record this folder in history
-				history.Add(folder.ServerRelativeUrl);
-				history_this_session++;
-				if (history_this_session % 10 == 0)
-					WriteSession();
-			}
-
-		}
-
-		public SharepointFolderCleaner(Uri site_uri, SharePointOnlineCredentials credentials, int num_workers = 0)
-		{
-			history_path = site_uri.ToString().Trim().ToLower();
-			foreach (var character in new char[] { ' ', '+', '-', ':', '/', '\\', '<', '>', '(', ')', '*', '.' })
-				history_path = history_path.Replace(character, '_');
-			history_path = $@"sharepoint_cleaner_{history_path}.xml";
-			Console.WriteLine($@"Session path: {history_path}");
-
-			if (System.IO.File.Exists(history_path))
-			{
-				try
-				{
-					history = history_path.XmlDeserialize<List<string>>();
-				}
-				catch (Exception e)
-				{
-					Console.Error.WriteLine($@"[{e.GetType()}] {e.Message}");
-					history = new List<string>();
-				}
-			}
-			else
-				history = new List<string>();
-
-			if (num_workers <= 0)
-				num_workers = 8;
-			workers = new SharepointFolderCleanerWorker[Math.Min(Math.Max(num_workers, 1), 64)];
-
-			using (ClientContext context = new ClientContext(site_uri))
-			{
-				context.Credentials = credentials;
-				context.Load(context.Web, w => w.Folders, w => w.CurrentUser, w => w.Lists);
-				context.ExecuteQueryWithDelay();
-
-				if (!context.Web.CurrentUser.IsSiteAdmin)
-					throw new Exception("Access denied. User must be a site admin.");
-
-				foreach (var folder in context.Web.Folders)
-					EnqueueFolder(context, site_uri, credentials, folder);
-			}
-		}
-
-		public void Wait()
-		{
-			foreach (var worker in workers)
-			{
-				if (worker != null)
-					worker.Wait();
-			}
-		}
-
-		private void WriteSession()
-		{
-			try
-			{
-				history.XmlSerialize(history_path);
-				Console.WriteLine($@"Session written to {history_path}");
-			}
-			catch (Exception)
-			{
-
-			}
-		}
-
-		public void Dispose()
-		{
-			if (!disposed)
-			{
-				disposed = true;
-				foreach (var worker in workers)
-				{
-					if (worker != null)
-						worker.Dispose();
-				}
-				WriteSession();
-			}
-			GC.SuppressFinalize(this);
-		}
+		[XmlIgnore]
+		public long FilesThisSession;
+		[XmlIgnore]
+		public long FoldersThisSession;
+		[XmlIgnore]
+		public long VersionsThisSession;
 	}
 
 	internal class Program
 	{
+		private static readonly object console_mutex = new object();
+
+
+		private static void ColouredPrint(ConsoleColor col, TextWriter stream, string msg, params object[] args)
+		{
+			lock (console_mutex)
+			{
+				var prev = Console.ForegroundColor;
+				Console.ForegroundColor = col;
+
+				try
+				{
+					if (args != null && args.Length > 0)
+						stream.Write(msg, args);
+					else
+						stream.Write(msg);
+				}
+				finally
+				{
+					Console.ForegroundColor = prev;
+				}
+			}
+		}
+
+		public static void Error(string msg, params object[] args)
+		{
+			ColouredPrint(ConsoleColor.Red, Console.Error, msg, args);
+		}
+
+		public static void Warning(string msg, params object[] args)
+		{
+			ColouredPrint(ConsoleColor.Yellow, Console.Error, msg, args);
+		}
+
+		public static void Info(string msg, params object[] args)
+		{
+			ColouredPrint(ConsoleColor.White, Console.Out, msg, args);
+		}
+
+		private class State
+		{
+			public Uri SiteURI;
+			public SharePointOnlineCredentials Credentials;
+			public string SessionPath;
+			public Session Session;
+			public ClientContext Context;
+			public volatile bool Abort = false;
+
+			private DateTime last_save = DateTime.UtcNow;
+
+			public void LoadSession()
+			{
+				if (System.IO.File.Exists(SessionPath))
+				{
+					try
+					{
+						Session = SessionPath.XmlDeserialize<Session>();
+
+						// reject sessions older than a week or continuations older than a day
+						if ((DateTime.UtcNow - Session.Started) >= TimeSpan.FromDays(7)
+							|| (DateTime.UtcNow - Session.Continued) >= TimeSpan.FromDays(1))
+							Session = null;
+					}
+					catch (Exception e)
+					{
+						Error($"[{e.GetType()}] {e.Message}\n");
+					}
+				}
+				if (Session == null)
+				{
+					Session = new Session
+					{
+						Started = DateTime.UtcNow
+					};
+				}
+				Session.Continued = DateTime.UtcNow;
+			}
+
+			public void SaveSession()
+			{
+				Session.Continued = DateTime.UtcNow;
+
+				try
+				{
+					Session.XmlSerialize(SessionPath);
+					Info($"Session written to {SessionPath}\n");
+				}
+				catch (Exception e)
+				{
+					Error($"[{e.GetType()}] {e.Message}\n");
+				}
+
+			}
+
+			private void IntermittentSaveSession()
+			{
+				var now = DateTime.UtcNow;
+				if ((now - last_save) >= TimeSpan.FromSeconds(60))
+				{
+					SaveSession();
+					last_save = now;
+				}
+			}
+
+			private bool AlreadyProcessed(SharePointFile file)
+			{
+				return Session.Processed.Contains(file.ServerRelativeUrl);
+			}
+
+			private bool AlreadyProcessed(SharePointFolder folder)
+			{
+				return Session.Processed.Contains(folder.ServerRelativeUrl);
+			}
+
+			private void RecordAsProcessed(SharePointFile file)
+			{
+				Session.Processed.Add(file.ServerRelativeUrl);
+				Session.FilesThisSession++;
+			}
+
+			private void RecordAsProcessed(SharePointFolder folder)
+			{
+				Session.Processed.Add(folder.ServerRelativeUrl);
+				Session.FoldersThisSession++;
+			}
+			private void RecordAsProcessed(FileVersionCollection versions)
+			{
+				Session.VersionsThisSession += versions.Count;
+			}
+
+			public void Clean(SharePointFolder folder)
+			{
+				if (AlreadyProcessed(folder) || Abort)
+					return;
+
+				Context.Load(folder, f => f.Folders, f => f.Files);
+				if (!Context.ExecuteQueryWithDelayAndAuthCheck() || Abort)
+					return; // silently skip folders requiring higher auth
+
+				Info($"{folder.ServerRelativeUrl}\n");
+
+				// handle files
+				if (folder.Files.Count > 0)
+				{
+					// request versions for each file
+					bool versions_ok = false;
+					try
+					{
+						foreach (var file in folder.Files)
+							Context.Load(file, f => f.Versions);
+						Context.ExecuteQueryWithDelay();
+						versions_ok = true;
+					}
+					catch (Exception e)
+					{
+						Warning($"[{e.GetType()}] {e.Message}\n");
+					}
+					
+					if (Abort)
+						return;
+
+					// delete the old versions
+					if (versions_ok)
+					{
+						var num_deletes = 0;
+						foreach (var file in folder.Files)
+						{
+							if (Abort)
+								break;
+
+							if (AlreadyProcessed(file) || file.Versions.Count == 0)
+								continue;
+
+							RecordAsProcessed(file);
+							RecordAsProcessed(file.Versions);
+							num_deletes += file.Versions.Count;
+							file.Versions.DeleteAll();
+
+							// send requests every 50 versions so they don't get too big
+							if (num_deletes >= 50)
+							{
+								Context.ExecuteQueryWithDelay();
+								num_deletes = 0;
+							}
+						}
+						if (num_deletes > 0)
+							Context.ExecuteQueryWithDelay();
+					}
+				}
+
+				// handle subfolders
+				foreach (var subfolder in folder.Folders)
+					Clean(subfolder);
+
+				// handle subfolders and finish up
+				if (!Abort)
+				{
+					RecordAsProcessed(folder);
+					IntermittentSaveSession();
+				}
+			}
+		}
+
 		private static SecureString ReadSecureString()
 		{
 			var pwd = new SecureString();
@@ -322,58 +275,98 @@ namespace sharepoint_cleaner
 				ConsoleKeyInfo i = Console.ReadKey(true);
 				if (i.Key == ConsoleKey.Enter)
 				{
-					break;
+					pwd.MakeReadOnly();
+					return pwd;
 				}
 				else if (i.Key == ConsoleKey.Backspace)
 				{
 					if (pwd.Length > 0)
 					{
 						pwd.RemoveAt(pwd.Length - 1);
-						Console.Write("\b \b");
+						Info("\b \b");
 					}
 				}
 				else if (i.KeyChar != '\u0000')
 				{
 					pwd.AppendChar(i.KeyChar);
-					Console.Write("*");
+					Info("*");
 				}
 			}
-			pwd.MakeReadOnly();
-			return pwd;
 		}
 
-		private static Uri ReadURI()
+		private static Uri ReadURI(string input = null)
 		{
-			var uri = Console.ReadLine().Trim();
+			var uri = input == null ? Console.ReadLine().Trim() : input;
 			uri = uri.StartsWith("https://") ? uri.Substring("https://".Length) : uri;
 			return new Uri($"https://{uri}");
 		}
 
-		private static void Run()
+		private static void Run(string[] args)
 		{
-			Console.Write("Sharepoint site URI: ");
-			var site_uri = ReadURI();
+			Info("---------------------------------------------------------\n");
+			Info("sharepoint-cleaner - github.com/marzer/sharepoint-cleaner\n");
+			Info("---------------------------------------------------------\n");
+			State state = new State();
 
-			Console.Write("Username: ");
-			var username = Console.ReadLine().Trim();
+			Info("Site URI: ");
+			state.SiteURI = args.Length >= 1 ? ReadURI(args[0]) : ReadURI();
+			if (args.Length >= 1)
+				Info($"{state.SiteURI}\n");
 
-			Console.Write("Password: ");
-			var password = ReadSecureString();
-			Console.WriteLine();
+			Info("Username: ");
+			var username = args.Length >= 2 ? args[1] : Console.ReadLine().Trim();
+			if (args.Length >= 2)
+				Info($"{username}\n");
 
-			using (var cleaner = new SharepointFolderCleaner(site_uri, new SharePointOnlineCredentials(username, password)))
-				cleaner.Wait();
+			Info("Password: ");
+			state.Credentials = new SharePointOnlineCredentials(username, ReadSecureString());
+			Info("\n");
+
+			// initialized session
+			state.SessionPath = state.SiteURI.ToString().Trim().ToLower();
+			foreach (var character in new char[] { ' ', '+', '-', ':', '/', '\\', '<', '>', '(', ')', '*', '.', '?', '@' })
+				state.SessionPath = state.SessionPath.Replace(character, '_');
+			state.SessionPath = $@"{state.SessionPath}_{username}";
+			state.SessionPath = ((uint)state.SessionPath.GetHashCode()).ToString();
+			state.SessionPath = $@"sharepoint-cleaner_{state.SessionPath}.xml";
+			Info($"Session: {state.SessionPath}\n");
+			Info("---------------------------------------------------------\n");
+			state.LoadSession();
+			Console.CancelKeyPress += (sender, args) =>
+			{
+				args.Cancel = true;
+				state.Abort = true;
+				Info("Aborting...\n");
+			};
+
+			// do the thing
+			using (var context = new ClientContext(state.SiteURI))
+			{
+				state.Context = context;
+				context.Credentials = state.Credentials;
+				context.Load(context.Web, w => w.Folders);
+				if (!context.ExecuteQueryWithDelayAndAuthCheck())
+					throw new Exception("Access denied.");
+
+				foreach (var folder in context.Web.Folders)
+					state.Clean(folder);
+			}
+
+			// finish up
+			state.SaveSession();
+			Info("---------------------------------------------------------\n");
+			Info($"Processed {state.Session.FilesThisSession} files and {state.Session.FoldersThisSession} folders, deleting {state.Session.VersionsThisSession} past versions.\n");
 		}
 
 		static void Main(string[] args)
 		{
 			try
 			{
-				Run();
+				Run(args);
 			}
 			catch (Exception e)
 			{
-				Console.Error.WriteLine($@"[{e.GetType()}] {e.Message}");
+				Error($"[{e.GetType()}] {e.Message}\n");
 			}
 		}
 	}
