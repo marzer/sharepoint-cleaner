@@ -46,6 +46,41 @@ namespace sharepoint_cleaner
 			using (var stream = System.IO.File.OpenWrite(path))
 				serializer.Serialize(stream, obj);
 		}
+
+		public static SecureString ToSecureString(this string str)
+		{
+			var pwd = new SecureString();
+			foreach (char c in str)
+				pwd.AppendChar(c);
+			return pwd;
+		}
+
+		private static readonly string[] ToFileSizeString_suffixes = new string[]{
+			"MB", "GB", "TB", "PB", "EB", "ZB", "YB"
+		};
+
+		public static string ToFileSizeString(this long bytes)
+		{
+			if (bytes < 1024L)
+				return $"{bytes} B";
+			else if (bytes < 1024L * 1024L)
+				return $"{bytes / 1024L} KB";
+			else
+			{
+				var dbytes = (double)bytes;
+				var log = 0;
+				while (dbytes >= 1024.0)
+				{
+					dbytes /= 1024.0;
+					log++;
+				}
+				if (log >= ToFileSizeString_suffixes.Length)
+					return $"{bytes} B";
+
+				return $"{dbytes:0.0#} {ToFileSizeString_suffixes[log]}";
+
+			}
+		}
 	}
 
 	public class Session
@@ -60,6 +95,8 @@ namespace sharepoint_cleaner
 		public long FoldersThisSession;
 		[XmlIgnore]
 		public long VersionsThisSession;
+		[XmlIgnore]
+		public long FreedSpaceThisSession;
 	}
 
 	internal class Program
@@ -192,6 +229,8 @@ namespace sharepoint_cleaner
 			private void RecordAsProcessed(FileVersionCollection versions)
 			{
 				Session.VersionsThisSession += versions.Count;
+				foreach (var v in versions)
+					Session.FreedSpaceThisSession += v.Size;
 			}
 
 			public void Clean(SharePointFolder folder)
@@ -209,48 +248,98 @@ namespace sharepoint_cleaner
 				if (folder.Files.Count > 0)
 				{
 					// request versions for each file
-					bool versions_ok = false;
-					try
+					bool any_versions_requested = false;
+					int pending_version_requests = 0;
+					var FlushVersionRequests = (bool force) => {
+						if (pending_version_requests > 0 && (pending_version_requests >= 10 || force))
+						{
+							try
+							{
+								Context.ExecuteQueryWithDelay();
+							}
+							catch (Exception e)
+							{
+								Warning($"[{e.GetType()}] {e.Message}\n");
+							}
+							pending_version_requests = 0;
+						}
+					};
+					foreach (var file in folder.Files)
 					{
-						foreach (var file in folder.Files)
+						if (AlreadyProcessed(file))
+							continue;
+
+						try
+						{
 							Context.Load(file, f => f.Versions);
-						Context.ExecuteQueryWithDelay();
-						versions_ok = true;
+							pending_version_requests++;
+							FlushVersionRequests(false);
+							any_versions_requested = true;
+						}
+						catch (Exception e)
+						{
+							Warning($"[{e.GetType()}] {e.Message}\n");
+						}
+
+						if (Abort)
+							return;
 					}
-					catch (Exception e)
-					{
-						Warning($"[{e.GetType()}] {e.Message}\n");
-					}
-					
+					FlushVersionRequests(true);
 					if (Abort)
 						return;
 
 					// delete the old versions
-					if (versions_ok)
+					if (any_versions_requested)
 					{
-						var num_deletes = 0;
+						var pending_deletes = 0;
+						var FlushDeleteRequests = (bool force) => {
+							if (pending_deletes > 0 && (pending_deletes >= 50 || force))
+							{
+								try
+								{
+									Context.ExecuteQueryWithDelay();
+								}
+								catch (Exception e)
+								{
+									Warning($"[{e.GetType()}] {e.Message}\n");
+								}
+								pending_deletes = 0;
+							}
+						};
+
 						foreach (var file in folder.Files)
 						{
 							if (Abort)
 								break;
 
-							if (AlreadyProcessed(file) || file.Versions.Count == 0)
+							if (AlreadyProcessed(file))
 								continue;
 
-							RecordAsProcessed(file);
-							RecordAsProcessed(file.Versions);
-							num_deletes += file.Versions.Count;
-							file.Versions.DeleteAll();
-
-							// send requests every 50 versions so they don't get too big
-							if (num_deletes >= 50)
+							try
 							{
-								Context.ExecuteQueryWithDelay();
-								num_deletes = 0;
+								RecordAsProcessed(file);
+								RecordAsProcessed(file.Versions);
+								pending_deletes += file.Versions.Count;
 							}
+							catch (CollectionNotInitializedException e)
+							{
+								continue; // this would be because the file version request failed
+							}
+							catch (Exception e)
+							{
+								Warning($"[{e.GetType()}] {e.Message}\n");
+								continue;
+							}
+
+							if (file.Versions.Count == 0)
+								continue;
+
+							Info($"    Deleting {file.Versions.Count} past versions of {file.ServerRelativeUrl}\n");
+
+							file.Versions.DeleteAll();
+							FlushDeleteRequests(false);
 						}
-						if (num_deletes > 0)
-							Context.ExecuteQueryWithDelay();
+						FlushDeleteRequests(true);
 					}
 				}
 
@@ -318,9 +407,14 @@ namespace sharepoint_cleaner
 			if (args.Length >= 2)
 				Info($"{username}\n");
 
-			Info("Password: ");
-			state.Credentials = new SharePointOnlineCredentials(username, ReadSecureString());
-			Info("\n");
+			if (args.Length >= 3)
+				state.Credentials = new SharePointOnlineCredentials(username, args[2].ToSecureString());
+			else
+			{
+				Info("Password: ");
+				state.Credentials = new SharePointOnlineCredentials(username, ReadSecureString());
+				Info("\n");
+			}
 
 			// initialized session
 			state.SessionPath = state.SiteURI.ToString().Trim().ToLower();
@@ -355,7 +449,7 @@ namespace sharepoint_cleaner
 			// finish up
 			state.SaveSession();
 			Info("---------------------------------------------------------\n");
-			Info($"Processed {state.Session.FilesThisSession} files and {state.Session.FoldersThisSession} folders, deleting {state.Session.VersionsThisSession} past versions.\n");
+			Info($"Processed {state.Session.FilesThisSession} files and {state.Session.FoldersThisSession} folders, deleting {state.Session.VersionsThisSession} past versions and freeing {state.Session.FreedSpaceThisSession.ToFileSizeString()}.\n");
 		}
 
 		static void Main(string[] args)

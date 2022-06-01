@@ -4,3 +4,5 @@
 *.suo
 *.zip
 *.user
+.vs
+sharepoint-cleaner_*.xml
