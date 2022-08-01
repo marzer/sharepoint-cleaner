@@ -43,7 +43,7 @@ namespace sharepoint_cleaner
 		public static void XmlSerialize<T>(this T obj, string path) where T : class
 		{
 			XmlSerializer serializer = new XmlSerializer(typeof(T));
-			using (var stream = System.IO.File.OpenWrite(path))
+			using (var stream = System.IO.File.Create(path))
 				serializer.Serialize(stream, obj);
 		}
 
@@ -56,15 +56,13 @@ namespace sharepoint_cleaner
 		}
 
 		private static readonly string[] ToFileSizeString_suffixes = new string[]{
-			"MB", "GB", "TB", "PB", "EB", "ZB", "YB"
+			"B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB"
 		};
 
 		public static string ToFileSizeString(this long bytes)
 		{
-			if (bytes < 1024L)
-				return $"{bytes} B";
-			else if (bytes < 1024L * 1024L)
-				return $"{bytes / 1024L} KB";
+			if (bytes == 0L)
+				return "0 B";
 			else
 			{
 				var dbytes = (double)bytes;
