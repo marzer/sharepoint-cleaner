@@ -2,6 +2,7 @@ using Microsoft.SharePoint.Client;
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Security;
 using System.Threading;
 using System.Xml.Serialization;
@@ -87,20 +88,37 @@ namespace sharepoint_cleaner
 		public DateTime Continued;
 		public HashSet<string> Processed { get; private set; } = new HashSet<string>();
 
-		[XmlIgnore]
+		// "Run" vs "Session":
+		// - runs are singular runs of the application, disregarding any session continuation
+		// - sessions are the cumulative sessions that might be spread over multiple runs
+
 		public long FilesThisSession;
-		[XmlIgnore]
 		public long FoldersThisSession;
-		[XmlIgnore]
 		public long VersionsThisSession;
-		[XmlIgnore]
 		public long FreedSpaceThisSession;
+
+		[XmlIgnore]
+		public long FilesThisRun;
+		[XmlIgnore]
+		public long FoldersThisRun;
+		[XmlIgnore]
+		public long VersionsThisRun;
+		[XmlIgnore]
+		public long FreedSpaceThisRun;
 	}
 
 	internal class Program
 	{
 		private static readonly object console_mutex = new object();
 
+		private static string ExceptionName(Exception e)
+		{
+			if (e as ServerException != null)
+				return "ServerException";
+			if (e as System.Net.WebException != null)
+				return "WebException";
+			return e.GetType().FullName;
+		}
 
 		private static void ColouredPrint(ConsoleColor col, TextWriter stream, string msg, params object[] args)
 		{
@@ -164,7 +182,7 @@ namespace sharepoint_cleaner
 					}
 					catch (Exception e)
 					{
-						Error($"[{e.GetType()}] {e.Message}\n");
+						Error($"[{ExceptionName(e)}] {e.Message}\n");
 					}
 				}
 				if (Session == null)
@@ -188,7 +206,7 @@ namespace sharepoint_cleaner
 				}
 				catch (Exception e)
 				{
-					Error($"[{e.GetType()}] {e.Message}\n");
+					Error($"[{ExceptionName(e)}] {e.Message}\n");
 				}
 
 			}
@@ -215,20 +233,30 @@ namespace sharepoint_cleaner
 
 			private void RecordAsProcessed(SharePointFile file)
 			{
-				Session.Processed.Add(file.ServerRelativeUrl);
-				Session.FilesThisSession++;
+				if (Session.Processed.Add(file.ServerRelativeUrl))
+				{
+					Session.FilesThisRun++;
+					Session.FilesThisSession++;
+				}
 			}
 
 			private void RecordAsProcessed(SharePointFolder folder)
 			{
-				Session.Processed.Add(folder.ServerRelativeUrl);
-				Session.FoldersThisSession++;
+				if (Session.Processed.Add(folder.ServerRelativeUrl))
+				{
+					Session.FoldersThisRun++;
+					Session.FoldersThisSession++;
+				}
 			}
 			private void RecordAsProcessed(FileVersionCollection versions)
 			{
+				Session.VersionsThisRun += versions.Count;
 				Session.VersionsThisSession += versions.Count;
 				foreach (var v in versions)
+				{
+					Session.FreedSpaceThisRun += v.Size;
 					Session.FreedSpaceThisSession += v.Size;
+				}
 			}
 
 			public void Clean(SharePointFolder folder)
@@ -242,108 +270,173 @@ namespace sharepoint_cleaner
 
 				Info($"{folder.ServerRelativeUrl}\n");
 
-				// handle files
-				if (folder.Files.Count > 0)
+				List<SharePointFile> batch = new List<SharePointFile>();
+				long prev_versions = Session.VersionsThisRun;
+				long prev_freed_space = Session.FreedSpaceThisRun;
+
+				var FlushBatch = (bool force) =>
 				{
-					// request versions for each file
-					bool any_versions_requested = false;
-					int pending_version_requests = 0;
-					var FlushVersionRequests = (bool force) => {
-						if (pending_version_requests > 0 && (pending_version_requests >= 10 || force))
-						{
-							try
-							{
-								Context.ExecuteQueryWithDelay();
-							}
-							catch (Exception e)
-							{
-								Warning($"[{e.GetType()}] {e.Message}\n");
-							}
-							pending_version_requests = 0;
-						}
-					};
-					foreach (var file in folder.Files)
-					{
-						if (AlreadyProcessed(file))
-							continue;
-
-						try
-						{
-							Context.Load(file, f => f.Versions);
-							pending_version_requests++;
-							FlushVersionRequests(false);
-							any_versions_requested = true;
-						}
-						catch (Exception e)
-						{
-							Warning($"[{e.GetType()}] {e.Message}\n");
-						}
-
-						if (Abort)
-							return;
-					}
-					FlushVersionRequests(true);
-					if (Abort)
+					if (batch.Count == 0 || (batch.Count < 50 && !force))
 						return;
 
-					// delete the old versions
-					if (any_versions_requested)
-					{
-						var pending_deletes = 0;
-						var FlushDeleteRequests = (bool force) => {
-							if (pending_deletes > 0 && (pending_deletes >= 50 || force))
-							{
-								try
-								{
-									Context.ExecuteQueryWithDelay();
-								}
-								catch (Exception e)
-								{
-									Warning($"[{e.GetType()}] {e.Message}\n");
-								}
-								pending_deletes = 0;
-							}
-						};
+					var original_batch = batch.ToList();
 
-						foreach (var file in folder.Files)
+					try
+					{
+						// get versions for whole batch
+						for (int i = batch.Count; i --> 0;)
 						{
 							if (Abort)
 								break;
 
-							if (AlreadyProcessed(file))
-								continue;
-
 							try
 							{
-								RecordAsProcessed(file);
-								RecordAsProcessed(file.Versions);
-								pending_deletes += file.Versions.Count;
-							}
-							catch (CollectionNotInitializedException e)
-							{
-								continue; // this would be because the file version request failed
+								Context.Load(batch[i], f => f.Versions);
 							}
 							catch (Exception e)
 							{
-								Warning($"[{e.GetType()}] {e.Message}\n");
-								continue;
+								Warning($"[{ExceptionName(e)}] requesting versions for {batch[i].ServerRelativeUrl}: {e.Message}\n");
+								batch.RemoveAt(i);
 							}
-
-							if (file.Versions.Count == 0)
-								continue;
-
-							Info($"    Deleting {file.Versions.Count} past versions of {file.ServerRelativeUrl}\n");
-
-							file.Versions.DeleteAll();
-							FlushDeleteRequests(false);
 						}
-						FlushDeleteRequests(true);
+
+						// if all version requests failed to enqueue then there's no work to do
+						if (batch.Count == 0 || Abort)
+							return;
+
+						// process the version requests
+						try
+						{
+							Context.ExecuteQueryWithDelay();
+						}
+						catch (Exception e)
+						{
+							Warning($"[{ExceptionName(e)}] failed to request versions for batch: {e.Message}\n");
+							Warning($"Attempting to re-request versions individually...\n");
+
+							for (int i = batch.Count; i --> 0;)
+							{
+								if (Abort)
+									break;
+
+								try
+								{
+									Context.Load(batch[i], f => f.Versions);
+									Context.ExecuteQueryWithDelay();
+								}
+								catch (Exception e2)
+								{
+									Warning($"[{ExceptionName(e2)}] requesting versions for {batch[i].ServerRelativeUrl}: {e.Message}\n");
+									batch.RemoveAt(i);
+								}
+							}
+						}
+
+						// if all version requests failed then there's no work to do
+						if (batch.Count == 0 || Abort)
+							return;
+
+						// request history deletion for whole queue
+						for (int i = batch.Count; i --> 0;)
+						{
+							if (Abort)
+								break;
+
+							try
+							{
+								if (batch[i].Versions.Count == 0)
+									continue;
+								RecordAsProcessed(batch[i].Versions);
+								batch[i].Versions.DeleteAll();
+							}
+							catch (CollectionNotInitializedException e)
+							{
+								batch.RemoveAt(i); // no history for this object
+							}
+							catch (Exception e)
+							{
+								Warning($"[{ExceptionName(e)}] requesting version history deletion for {batch[i].ServerRelativeUrl}: {e.Message}\n");
+								batch.RemoveAt(i);
+							}
+						}
+
+						// if all deletion requests failed to enqueue then there's no work to do
+						if (batch.Count == 0 || Abort)
+							return;
+
+						// process the deletion requests
+						try
+						{
+							Context.ExecuteQueryWithDelay();
+						}
+						catch (Exception e)
+						{
+							Warning($"[{ExceptionName(e)}] failed to delete version histories for batch: {e.Message}\n");
+							Warning($"Attempting to delete version histories individually...\n");
+
+							for (int i = batch.Count; i-- > 0;)
+							{
+								if (Abort)
+									break;
+
+								try
+								{
+									batch[i].Versions.DeleteAll();
+									RecordAsProcessed(batch[i].Versions);
+									Context.ExecuteQueryWithDelay();
+								}
+								catch (Exception e2)
+								{
+									Warning($"[{ExceptionName(e2)}] deleting version history for {batch[i].ServerRelativeUrl}: {e.Message}\n");
+									batch.RemoveAt(i);
+								}
+							}
+						}
+
+						batch.Clear();
+						long versions = Session.VersionsThisRun - prev_versions;
+						long freed_space = Session.FreedSpaceThisRun - prev_freed_space;
+						if (versions > 0)
+						{
+							Info($"Batch deleted {versions} past versions ({freed_space.ToFileSizeString()}).\n");
+						}
 					}
+					finally
+					{
+						if (!Abort)
+						{
+							foreach (var file in original_batch)
+								RecordAsProcessed(file);
+							IntermittentSaveSession();
+						}
+					}
+				};
+
+				// handle files
+				foreach (var file in folder.Files)
+				{
+					if (Abort)
+						return;
+					if (AlreadyProcessed(file))
+						continue;
+
+					batch.Add(file);
+					FlushBatch(false);
 				}
+				FlushBatch(true);
+				if (Abort)
+					return;
 
 				// handle subfolders
-				foreach (var subfolder in folder.Folders)
+				var subfolders = folder.Folders.ToList();
+				subfolders.Sort((a, b) => a.ServerRelativeUrl.CompareTo(b.ServerRelativeUrl));
+				foreach (var subfolder in subfolders)
+				{
+					if (Abort)
+						return;
+
 					Clean(subfolder);
+				}
 
 				// handle subfolders and finish up
 				if (!Abort)
@@ -440,25 +533,34 @@ namespace sharepoint_cleaner
 				if (!context.ExecuteQueryWithDelayAndAuthCheck())
 					throw new Exception("Access denied.");
 
-				foreach (var folder in context.Web.Folders)
+				var folders = context.Web.Folders.ToList();
+				folders.Sort((a, b) => a.ServerRelativeUrl.CompareTo(b.ServerRelativeUrl));
+				foreach (var folder in folders)
+				{
+					if (state.Abort)
+						break;
 					state.Clean(folder);
+				}
 			}
 
 			// finish up
 			state.SaveSession();
 			Info("---------------------------------------------------------\n");
-			Info($"Processed {state.Session.FilesThisSession} files and {state.Session.FoldersThisSession} folders, deleting {state.Session.VersionsThisSession} past versions and freeing {state.Session.FreedSpaceThisSession.ToFileSizeString()}.\n");
+			Info($"  This run: processed {state.Session.FilesThisRun} files and {state.Session.FoldersThisRun} folders; deleted {state.Session.VersionsThisRun} past versions ({state.Session.FreedSpaceThisRun.ToFileSizeString()}).\n");
+			Info($"Cumulative: processed {state.Session.FilesThisSession} files and {state.Session.FoldersThisSession} folders; deleted {state.Session.VersionsThisSession} past versions ({state.Session.FreedSpaceThisSession.ToFileSizeString()}).\n");
 		}
 
-		static void Main(string[] args)
+		static int Main(string[] args)
 		{
 			try
 			{
 				Run(args);
+				return 0;
 			}
 			catch (Exception e)
 			{
-				Error($"[{e.GetType()}] {e.Message}\n");
+				Error($"[{ExceptionName(e)}] {e.Message}\n");
+				return 1;
 			}
 		}
 	}

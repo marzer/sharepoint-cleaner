@@ -4,5 +4,7 @@
 *.suo
 *.zip
 *.user
+*.dll
+*.exe
 .vs
 sharepoint-cleaner_*.xml
